@@ -72,6 +72,8 @@ import asyncio
 import datetime
 import sys
 import traceback
+import time
+from collections import Counter
 
 try:
     import aiohttp
@@ -85,7 +87,8 @@ TIME_BETWEEN_TAG_REFRESH = 5*60
 TIME_BETWEEN_RECONNECT = 30
 
 post_count = 0
-servers = {}
+forwarded_count = 0
+servers = Counter()
 total = 0
 posts = {}
 posts_order = [] 
@@ -143,10 +146,13 @@ class UserConnection:
             await asyncio.sleep(TIME_BETWEEN_TAG_REFRESH)
             self.tags = await self.followed_tags()
 
-    async def queue_post(self, tags, url:str):
+    async def queue_post(self, tag_list:list, url:str):
+        global forwarded_count
+        tags = set(t.decode().lower() for t in tag_list)
         intersection = self.tags.intersection(tags)
         if len(intersection)>0:
-            print(f"{datetime.datetime.now()}: Sending {url.decode()} with tags {intersection} to {self.server}")
+            forwarded_count += 1
+            #print(f"{datetime.datetime.now()}: Sending {url.decode()} with tags {intersection} to {self.server}")
             await self.posts.put(url)
 
     async def send_posts(self):
@@ -181,41 +187,54 @@ class UserConnection:
                 return tags
         return None
 
-async def process_update(data):
-    global total, posts_order, post_count
-    try:
-        url,_ = getfield(data, b"\"uri\":")
-        if url is not None:
-            # Is this new or a duplicate?
-            if url in posts:
-                return
-            else:
-                posts[url] = [url,[]]
-                posts_order += [url]
-                while len(posts_order)>DUPLICATE_HISTORY_LENGTH:
-                    del posts[posts_order.pop(0)]
-            server = url[8:].split(b"/")[0]
-            total += 1
-            if server in servers:
-                servers[server]+=1
-            else:
-                servers[server]=1
-            post_count += 1
-            tags = set([t.decode().lower() for t in getlist(data, b"\"tags\":")])
-            if len(tags)>0:
-                for user in users:
-                    await user.queue_post(tags, url)
-    except:
-        print("Exception:")
-        traceback.print_exc()
 
-async def server_stream(server):
+async def process_update(raw_post_queue):
+    global total, posts_order, post_count
+    average_time = 0.0
+    while True:
+        try:
+            data = await raw_post_queue.get()
+            #start = time.time()
+            url,_ = getfield(data, b"\"uri\":")
+            tags = []
+            skip = False
+            if url is not None:
+                # Is this new or a duplicate?
+                if url in posts:
+                    continue
+                else:
+                    posts[url] = [url,[]]
+                    posts_order += [url]
+                    while len(posts_order)>DUPLICATE_HISTORY_LENGTH:
+                        del posts[posts_order.pop(0)]
+                server = url[8:].split(b"/")[0]
+                total += 1
+                servers[server] += 1
+                post_count += 1
+                noindex = data.find(b"\"noindex\":true")!=-1
+                nobot = data.find(b"#nobot")!=-1
+                skip = noindex or nobot
+                if not skip:
+                    tags = getlist(data, b"\"tags\":")
+                    if len(tags)>0:
+                        for user in users:
+                            await user.queue_post(tags, url)
+            #end = time.time()
+            #took = end-start
+            #average_time = average_time * 0.99 + 0.01 * took
+            #print(f"{end-start:.06f}, {len(servers)}, {len(posts)} {average_time:.06f} {len(data)} {len(tags)} {skip}")
+        except:
+            print("Exception:")
+            traceback.print_exc()
+
+async def server_stream(server, raw_post_queue):
     while True:
         try:
             print(f"{datetime.datetime.now()}: Connecting to {server}")
             timeout = aiohttp.ClientTimeout(connect=10.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(f'https://{server}/api/v1/streaming/public') as response:
+                headers = {'Connection':'keep-alive'}
+                async with session.get(f'https://{server}/api/v1/streaming/public', headers=headers) as response:
                     print(f"{datetime.datetime.now()}: Connected to {server}")
                     get_next = False
                     while True:
@@ -224,7 +243,7 @@ async def server_stream(server):
                         if chunk==b'event: update\n':
                             get_next = True
                         if chunk[:5]==b'data:' and get_next:
-                            await process_update(chunk[5:])
+                            await raw_post_queue.put(chunk[5:])
                             get_next = False
         except:
             print("Exception:")
@@ -234,15 +253,16 @@ async def server_stream(server):
 
 
 def top_servers():
-    global post_count
+    global post_count, forwarded_count
     server_list = [(count, server) for server,count in servers.items()]
     server_list.sort()
     server_list.reverse()
-    print(f"{datetime.datetime.now()}: Posts:{post_count}\nTop 10 posting servers:")
+    print(f"{datetime.datetime.now()}: Posts: {post_count}\nForwarded: {forwarded_count}\nTop 10 posting servers:")
     for count, server in server_list[:10]:
         print(f"  {server.decode()} : {count}")
     servers.clear()
     post_count = 0
+    forwarded_count = 0
 
 def command_line():
     parser = argparse.ArgumentParser(
@@ -257,6 +277,8 @@ def command_line():
 async def main(loop):
     args = command_line()
 
+    raw_posts = asyncio.Queue()
+
     for user_info in open(args.user_list_file):
         user_info_clean = user_info.strip()
         if len(user_info_clean)==0: continue
@@ -267,8 +289,10 @@ async def main(loop):
     for server_address in open(args.server_list_file):
         server_address_clean = server_address.strip()
         if len(server_address_clean)==0: continue
-        stream = asyncio.create_task(server_stream(server_address_clean))
+        stream = asyncio.create_task(server_stream(server_address_clean, raw_posts))
         streams.append(stream)
+
+    processor = asyncio.create_task(process_update(raw_posts))
 
     while True:
         await asyncio.sleep(TIME_BETWEEN_STATS)
